@@ -1,26 +1,4 @@
-PS C:\Users\박강열>
-
-Remove-Item -Recurse -Force .git
-
-cd C:\Users\박강열\shorts_generator
-
-pwd
-
-@"
-.venv/
-__pycache__/
-tmp/
-output/
-*.pyc
-*.mkv
-*.mp4
-*.wav
-"@ | Set-Content .gitignore -Encoding UTF8
-
-git rm -r --cached .
-git add .
-git commit -m "clean upload"
-git push -f origin main
+Set-Location "C:\Users\박강열\shorts_generator"; git init; git remote add origin https://github.com/YoonJeongGo/shorts-generator.git; git add .; git commit -m "Local Overwrite $(Get-Date -Format 'yyyy-MM-dd HH:mm')"; git branch -M main; git push -u origin main --force
 
 
 

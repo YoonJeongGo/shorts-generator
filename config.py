@@ -1,3 +1,5 @@
+# 파일 경로: config.py
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -217,11 +219,24 @@ CLIP = {
 
     # 🔥 Hook 기반 start 재조정
     "enable_hook_retrim": True,
-    "hook_search_sec": 8.0,
-    "hook_pre_roll_sec": 1.5,
+
+    # 후보 탐색 범위
+    "hook_search_sec": 18.0,
+    "hook_search_back_sec": 6.0,
+
+    # 좋은 훅을 찾았으면 앞의 설명형 문장을 다시 끌고 오지 않도록 0으로 유지
+    "hook_pre_roll_sec": 0.0,
+
+    # 최소 이동 / 유지 조건
     "hook_min_shift_sec": 0.5,
     "hook_keep_min_duration_sec": 10.0,
-    "hook_min_improve": 0.2,
+
+    # 현재 시작보다 확실히 좋아야 교체
+    "hook_min_improve": 0.5,
+
+    # 훅 디버그 로그
+    "hook_debug": True,
+    "hook_debug_top_n": 3,
 }
 
 # ─────────────────────────────────────

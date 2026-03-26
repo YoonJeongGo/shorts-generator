@@ -40,15 +40,6 @@ class HighlightCandidate:
 
 
 class HighlightScorer:
-    """
-    실전형 규칙 기반 하이라이트 추출기.
-
-    설계 원칙:
-    1) 후보를 전부 만들지 않는다. -> 강한 seed 주변만 본다.
-    2) 점수 축은 줄인다. -> 길이 / hook / 강도 / 대화성 / 경계 / 대비 / 품질 + 보조 semantic
-    3) 디버깅 가능해야 한다. -> score_breakdown 제공
-    """
-
     DEFAULT_EMPHASIS_WORDS = [
         "진짜", "정말", "대박", "미쳤", "와", "헐", "설마", "왜", "어떻게",
         "결국", "드디어", "무조건", "확실", "반드시", "핵심", "중요", "끝내기",
@@ -171,6 +162,15 @@ class HighlightScorer:
         "나 지금",
         "제가 지금",
         "이거 지금",
+        "저번에",
+        "사실은",
+        "진짜 웃긴 게",
+        "결국",
+        "그게 뭐냐면",
+        "어떻게 됐냐면",
+        "말하자면",
+        "쉽게 말해서",
+        "정리하면",
     ]
 
     DEFAULT_EXPLAIN_SUBSTRINGS = [
@@ -193,6 +193,24 @@ class HighlightScorer:
         "먼저",
         "일단",
         "지금은",
+        "저번에",
+        "진짜 웃긴 게",
+        "결국 어떻게",
+        "그게 뭐냐면",
+        "어떻게 됐냐면",
+        "사실은",
+        "말하자면",
+        "쉽게 말해서",
+        "정리하면",
+        "보면은",
+        "봤더니",
+        "보니까",
+        "하는데",
+        "하더라고",
+        "하니까",
+        "라고 하더라",
+        "라고 해서",
+        "라는 거야",
     ]
 
     DEFAULT_SEMANTIC_ANCHORS = [
@@ -272,8 +290,10 @@ class HighlightScorer:
             candidates.extend(extra)
 
         deduped = self._dedupe_and_rank(candidates, local_top_k)
-        deduped = self.refine_highlight_starts(deduped, segments_norm)
-        return [item.to_dict() for item in deduped[:local_top_k]]
+        rebuilt = self.rebuild_highlight_openings(deduped, segments_norm)
+        reranked = self._rerank_after_rebuild(rebuilt)
+        final_candidates = self._dedupe_and_rank(reranked, local_top_k)
+        return [item.to_dict() for item in final_candidates[:local_top_k]]
 
     # ============================================================
     # Segment preparation
@@ -565,7 +585,7 @@ class HighlightScorer:
 
             e_idx += 1
 
-        refined = [dict(seg) for seg in segments[s_idx : e_idx + 1]]
+        refined = [dict(seg) for seg in segments[s_idx: e_idx + 1]]
         refined = self._trim_large_internal_gaps(refined)
         return refined
 
@@ -960,6 +980,13 @@ class HighlightScorer:
         candidates: List[HighlightCandidate],
         segments: List[Dict[str, Any]],
     ) -> List[HighlightCandidate]:
+        return self.rebuild_highlight_openings(candidates, segments)
+
+    def rebuild_highlight_openings(
+        self,
+        candidates: List[HighlightCandidate],
+        segments: List[Dict[str, Any]],
+    ) -> List[HighlightCandidate]:
         if not CLIP.get("enable_hook_retrim", False):
             return candidates
 
@@ -967,23 +994,24 @@ class HighlightScorer:
 
         search_back_sec = max(float(CLIP.get("hook_search_back_sec", 6.0)), 5.0)
         search_forward_sec = max(float(CLIP.get("hook_search_sec", 18.0)), 15.0)
-        pre_roll_sec = min(float(CLIP.get("hook_pre_roll_sec", 0.4)), 0.5)
+        pre_roll_sec = max(0.0, min(float(CLIP.get("hook_pre_roll_sec", 0.4)), 0.5))
         keep_min_duration_sec = float(CLIP.get("hook_keep_min_duration_sec", 10.0))
         max_extend_after_sec = float(CLIP.get("hook_max_extend_after_sec", 2.0))
-        hook_min_improve = max(float(CLIP.get("hook_min_improve", 0.35)), 0.35)
+        hook_min_improve = max(float(CLIP.get("hook_min_improve", 0.35)), 0.25)
         max_shift_sec = max(float(CLIP.get("hook_max_shift_sec", 8.0)), 6.0)
+        debug_top_n = int(CLIP.get("hook_debug_top_n", 3))
+        debug_enabled = bool(CLIP.get("hook_debug", False))
 
         for cand in candidates:
             original_start = float(cand.start)
             original_end = float(cand.end)
             original_duration = max(0.0, original_end - original_start)
-            original_segments = list(cand.segments)
             original_score = float(cand.score)
             original_reasons = list(cand.reasons)
             original_breakdown = dict(cand.score_breakdown)
 
             current_bundle = self._build_opening_bundle_by_time(
-                segments=original_segments,
+                segments=cand.segments,
                 anchor_idx=0,
                 max_bundle_sec=3.4,
             )
@@ -992,54 +1020,90 @@ class HighlightScorer:
                 original_start=original_start,
                 anchor_start=original_start,
                 max_shift_sec=max_shift_sec,
+                relaxed=False,
             )
-            current_opening_score = float(current_eval.get("score", -999.0))
-            current_explain = bool(current_eval.get("is_explain", False))
 
-            search_start = max(0.0, original_start - search_back_sec)
-            search_end = min(original_end + max_extend_after_sec, original_start + search_forward_sec)
+            strict_valid, strict_rejected = self._collect_opening_candidates(
+                segments=segments,
+                original_start=original_start,
+                original_end=original_end,
+                search_back_sec=search_back_sec,
+                search_forward_sec=search_forward_sec,
+                max_extend_after_sec=max_extend_after_sec,
+                max_shift_sec=max_shift_sec,
+                relaxed=False,
+            )
 
-            opening_candidates: List[Dict[str, Any]] = []
-            for idx, seg in enumerate(segments):
-                seg_start = float(seg["start"])
-                if seg_start < search_start or seg_start > search_end:
-                    continue
+            valid_candidates = strict_valid
+            rejected_candidates = strict_rejected
+            rescue_used = False
 
-                bundle = self._build_opening_bundle_by_time(
+            if current_eval.get("is_explain", False) or not valid_candidates:
+                rescue_valid, rescue_rejected = self._collect_opening_candidates(
                     segments=segments,
-                    anchor_idx=idx,
-                    max_bundle_sec=3.4,
-                )
-                if not bundle:
-                    continue
-
-                anchor_start = float(bundle[0]["start"])
-                if abs(anchor_start - original_start) > max_shift_sec:
-                    continue
-
-                eval_result = self._score_opening_bundle(
-                    bundle=bundle,
                     original_start=original_start,
-                    anchor_start=anchor_start,
-                    max_shift_sec=max_shift_sec,
+                    original_end=original_end,
+                    search_back_sec=max(search_back_sec, 8.0),
+                    search_forward_sec=max(search_forward_sec, 22.0),
+                    max_extend_after_sec=max_extend_after_sec + 1.0,
+                    max_shift_sec=max(max_shift_sec + 4.0, 10.0),
+                    relaxed=True,
                 )
-                if not eval_result.get("valid", False):
-                    continue
+                if rescue_valid:
+                    valid_candidates = rescue_valid
+                    rescue_used = True
+                rejected_candidates.extend(rescue_rejected)
 
-                opening_candidates.append(eval_result)
+            if debug_enabled:
+                self._print_hook_debug(
+                    current_eval=current_eval,
+                    opening_candidates=valid_candidates,
+                    rejected_candidates=rejected_candidates,
+                    top_n=debug_top_n,
+                    original_start=original_start,
+                    rescue_used=rescue_used,
+                )
 
-            if not opening_candidates:
+            if not valid_candidates:
+                if current_eval.get("is_explain", False):
+                    cand.reasons = self._unique_keep_order(
+                        cand.reasons + ["설명형 시작 유지됨(대체 후보 없음)"]
+                    )
+                    cand.score_breakdown["opening_penalty"] = round(
+                        float(cand.score_breakdown.get("opening_penalty", 0.0)) - 1.25, 4
+                    )
+                    cand.score = max(0.0, cand.score - 1.25)
+                if current_eval.get("reject_reason") == "no_hook_signal":
+                    cand.score_breakdown["opening_penalty"] = round(
+                        float(cand.score_breakdown.get("opening_penalty", 0.0)) - 1.5, 4
+                    )
+                    cand.score = max(0.0, cand.score - 1.5)
+                    cand.reasons = self._unique_keep_order(cand.reasons + ["최종 후보 패널티: no_hook_signal"])
                 results.append(cand)
                 continue
 
-            opening_candidates.sort(key=lambda x: x["score"], reverse=True)
-            best_eval = opening_candidates[0]
+            best_eval = valid_candidates[0]
 
             if not self._is_better_opening_than_original(
                 best_eval=best_eval,
                 current_eval=current_eval,
                 improve_threshold=hook_min_improve,
+                rescue_used=rescue_used,
             ):
+                if current_eval.get("is_explain", False):
+                    cand.reasons = self._unique_keep_order(
+                        cand.reasons + ["설명형 시작 잔류(교체 기준 미달)"]
+                    )
+                    cand.score_breakdown["opening_penalty"] = round(
+                        float(cand.score_breakdown.get("opening_penalty", 0.0)) - 1.0, 4
+                    )
+                    cand.score = max(0.0, cand.score - 1.0)
+                if current_eval.get("reject_reason") == "no_hook_signal":
+                    cand.score_breakdown["opening_penalty"] = round(
+                        float(cand.score_breakdown.get("opening_penalty", 0.0)) - 1.2, 4
+                    )
+                    cand.score = max(0.0, cand.score - 1.2)
+                    cand.reasons = self._unique_keep_order(cand.reasons + ["최종 후보 패널티: no_hook_signal"])
                 results.append(cand)
                 continue
 
@@ -1056,15 +1120,81 @@ class HighlightScorer:
                 original_score=original_score,
                 original_reasons=original_reasons,
                 original_breakdown=original_breakdown,
+                current_eval=current_eval,
+                rescue_used=rescue_used,
             )
 
             if applied is None:
+                if current_eval.get("is_explain", False):
+                    cand.reasons = self._unique_keep_order(
+                        cand.reasons + ["설명형 시작 잔류(적용 실패)"]
+                    )
+                    cand.score_breakdown["opening_penalty"] = round(
+                        float(cand.score_breakdown.get("opening_penalty", 0.0)) - 0.8, 4
+                    )
+                    cand.score = max(0.0, cand.score - 0.8)
                 results.append(cand)
                 continue
 
             results.append(applied)
 
         return results
+
+    def _collect_opening_candidates(
+        self,
+        segments: List[Dict[str, Any]],
+        original_start: float,
+        original_end: float,
+        search_back_sec: float,
+        search_forward_sec: float,
+        max_extend_after_sec: float,
+        max_shift_sec: float,
+        relaxed: bool,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        search_start = max(0.0, original_start - search_back_sec)
+        search_end = min(original_end + max_extend_after_sec, original_start + search_forward_sec)
+
+        valid_candidates: List[Dict[str, Any]] = []
+        rejected_candidates: List[Dict[str, Any]] = []
+
+        for idx, seg in enumerate(segments):
+            seg_start = float(seg["start"])
+            if seg_start < search_start or seg_start > search_end:
+                continue
+
+            bundle = self._build_opening_bundle_by_time(
+                segments=segments,
+                anchor_idx=idx,
+                max_bundle_sec=3.8 if relaxed else 3.4,
+            )
+            if not bundle:
+                continue
+
+            anchor_start = float(bundle[0]["start"])
+
+            eval_result = self._score_opening_bundle(
+                bundle=bundle,
+                original_start=original_start,
+                anchor_start=anchor_start,
+                max_shift_sec=max_shift_sec,
+                relaxed=relaxed,
+            )
+
+            if eval_result.get("valid", False):
+                valid_candidates.append(eval_result)
+            else:
+                rejected_candidates.append(eval_result)
+
+        valid_candidates.sort(key=lambda x: x["score"], reverse=True)
+        rejected_candidates.sort(
+            key=lambda x: (
+                1 if x.get("is_explain", False) else 0,
+                float(x.get("distance", 999.0)),
+                -float(x.get("raw_score", -999.0)),
+            )
+        )
+
+        return valid_candidates, rejected_candidates
 
     def _build_opening_bundle_by_time(
         self,
@@ -1098,11 +1228,14 @@ class HighlightScorer:
             bundle.append(seg)
 
             elapsed = seg_end - anchor_start
-            if elapsed >= 2.6 and len(bundle) >= 1:
-                break
+
             if elapsed >= max_bundle_sec:
                 break
-            if len(bundle) >= 3:
+
+            if len(bundle) >= 4:
+                break
+
+            if elapsed >= 2.6 and len(bundle) >= 2:
                 break
 
         return bundle
@@ -1113,46 +1246,65 @@ class HighlightScorer:
         original_start: float,
         anchor_start: float,
         max_shift_sec: float,
+        relaxed: bool = False,
     ) -> Dict[str, Any]:
         invalid_result = {
             "valid": False,
             "score": -999.0,
+            "raw_score": -999.0,
             "anchor_start": anchor_start,
             "bundle": bundle,
             "text": "",
             "first_line": "",
             "is_explain": False,
             "breakdown": {},
+            "distance": abs(anchor_start - original_start),
+            "reject_reason": "unknown",
+            "relaxed": relaxed,
         }
 
         if not bundle:
-            return invalid_result
+            result = dict(invalid_result)
+            result["reject_reason"] = "empty_bundle"
+            return result
 
         text = self._join_segment_texts(bundle)
         if not text:
-            return invalid_result
+            result = dict(invalid_result)
+            result["reject_reason"] = "empty_text"
+            return result
 
         first_line = self._normalize_text(str(bundle[0].get("text", "")))
         if not first_line:
-            return invalid_result
-
-        full_lower = text.lower()
-        first_lower = first_line.lower()
+            result = dict(invalid_result)
+            result["text"] = text
+            result["reject_reason"] = "empty_first_line"
+            return result
 
         token_count = len(self._tokenize(first_line))
         total_tokens = len(self._tokenize(text))
         quality = self._analyze_text_quality(text)
+        distance = abs(anchor_start - original_start)
+
+        result_base = dict(invalid_result)
+        result_base["text"] = text
+        result_base["first_line"] = first_line
+        result_base["distance"] = distance
+
+        if distance > max_shift_sec:
+            result_base["reject_reason"] = "shift_too_far"
+            return result_base
 
         is_explain = self._looks_like_explain_opening(first_line, text)
-        if is_explain:
-            result = dict(invalid_result)
-            result["text"] = text
-            result["first_line"] = first_line
-            result["is_explain"] = True
-            return result
+        if is_explain and not relaxed:
+            result_base["is_explain"] = True
+            result_base["reject_reason"] = "explain_opening"
+            return result_base
 
-        if token_count == 0 or token_count > 8:
-            return invalid_result
+        max_first_tokens = 12 if relaxed else 8
+        if token_count == 0 or token_count > max_first_tokens:
+            result_base["reject_reason"] = "first_line_too_long"
+            return result_base
 
         question_count = first_line.count("?") + text.count("?")
         exclaim_count = first_line.count("!") + text.count("!")
@@ -1160,14 +1312,18 @@ class HighlightScorer:
         strong_hits = sum(1 for p in self.DEFAULT_STRONG_PATTERNS if re.search(p, text))
         reaction_hits = sum(1 for p in self.DEFAULT_REACTION_PATTERNS if re.search(p, text))
 
-        has_required_signal = (
+        has_strong_hook = (
             question_count > 0
             or exclaim_count > 0
-            or hook_hits > 0
-            or strong_hits > 0
+            or strong_hits >= 2
+            or hook_hits >= 1
+            or reaction_hits >= 1
+            or (token_count <= 6 and self._contains_strong_pattern(first_line))
+            or (relaxed and self._contains_strong_pattern(text))
         )
-        if not has_required_signal:
-            return invalid_result
+        if not has_strong_hook:
+            result_base["reject_reason"] = "no_hook_signal"
+            return result_base
 
         bundle_start = float(bundle[0]["start"])
         bundle_end = float(bundle[-1]["end"])
@@ -1178,99 +1334,122 @@ class HighlightScorer:
         first_two_sec_tokens = len(self._tokenize(first_two_sec_text))
         first_two_sec_hook_hits = sum(1 for p in self.DEFAULT_HOOK_PATTERNS if re.search(p, first_two_sec_text))
         first_two_sec_reaction_hits = sum(1 for p in self.DEFAULT_REACTION_PATTERNS if re.search(p, first_two_sec_text))
-        distance = abs(anchor_start - original_start)
 
         breakdown: Dict[str, float] = {}
 
         if token_count <= 2:
-            breakdown["short_first_line"] = 7.0
+            breakdown["short_first_line"] = 3.0
         elif token_count <= 4:
-            breakdown["short_first_line"] = 5.6
+            breakdown["short_first_line"] = 2.5
         elif token_count <= 5:
-            breakdown["short_first_line"] = 4.2
+            breakdown["short_first_line"] = 1.8
         elif token_count <= 6:
-            breakdown["short_first_line"] = 2.3
+            breakdown["short_first_line"] = 1.0
+        elif relaxed and token_count <= 10:
+            breakdown["short_first_line"] = 0.2
         else:
-            breakdown["short_first_line"] = 0.6
+            breakdown["short_first_line"] = -0.8
 
-        breakdown["question"] = min(question_count * 3.2, 6.4)
-        breakdown["exclaim"] = min(exclaim_count * 2.5, 5.0)
-        breakdown["hook_hits"] = min(hook_hits * 1.0, 3.5)
-        breakdown["strong_hits"] = min(strong_hits * 0.9, 3.0)
-        breakdown["reaction_hits"] = min(reaction_hits * 0.8, 2.4)
-        breakdown["first_two_sec_focus"] = min((first_two_sec_hook_hits + first_two_sec_reaction_hits) * 1.0, 3.0)
+        breakdown["question"] = min(question_count * 1.8, 3.0)
+        breakdown["exclaim"] = min(exclaim_count * 1.5, 2.5)
+        breakdown["hook_hits"] = min(hook_hits * 0.6, 1.8)
+        breakdown["strong_hits"] = min(strong_hits * 0.8, 2.4)
+        breakdown["reaction_hits"] = min(reaction_hits * 0.5, 1.5)
+        breakdown["first_two_sec_focus"] = min((first_two_sec_hook_hits + first_two_sec_reaction_hits) * 0.6, 2.0)
 
         if bundle_duration <= 3.6:
-            breakdown["bundle_duration_fit"] = 1.3
+            breakdown["bundle_duration_fit"] = 1.2
         elif bundle_duration <= 4.2:
             breakdown["bundle_duration_fit"] = 0.4
         else:
-            breakdown["bundle_duration_fit"] = -1.0
+            breakdown["bundle_duration_fit"] = -0.8
 
         if first_seg_duration <= 2.8:
-            breakdown["quick_first_turn"] = 0.9
+            breakdown["quick_first_turn"] = 0.8
         else:
-            breakdown["quick_first_turn"] = -0.4
+            breakdown["quick_first_turn"] = -0.3
 
         if 1 <= len(bundle) <= 2:
-            breakdown["tight_bundle"] = 1.0
+            breakdown["tight_bundle"] = 0.9
         elif len(bundle) == 3:
             breakdown["tight_bundle"] = 0.3
         else:
-            breakdown["tight_bundle"] = -0.5
+            breakdown["tight_bundle"] = -0.4
 
         if first_two_sec_tokens <= 10:
-            breakdown["compact_first_two_sec"] = 1.0
+            breakdown["compact_first_two_sec"] = 0.9
         elif first_two_sec_tokens <= 14:
             breakdown["compact_first_two_sec"] = 0.2
         else:
-            breakdown["compact_first_two_sec"] = -0.8
+            breakdown["compact_first_two_sec"] = -0.7
 
         if self._looks_like_sentence_start(first_line):
-            breakdown["sentence_start"] = 0.8
+            breakdown["sentence_start"] = 0.6
         else:
-            breakdown["sentence_start"] = -1.1
+            breakdown["sentence_start"] = -0.9
 
         if float(quality.get("korean_ratio", 0.0)) >= 0.55:
-            breakdown["korean_ratio"] = 0.6
+            breakdown["korean_ratio"] = 0.5
         else:
             breakdown["korean_ratio"] = -0.3
 
         if float(quality.get("ascii_ratio", 0.0)) > 0.55:
-            breakdown["ascii_penalty"] = -1.2
+            breakdown["ascii_penalty"] = -1.0
         else:
             breakdown["ascii_penalty"] = 0.0
 
         if float(quality.get("filler_ratio", 0.0)) > 0.35:
-            breakdown["filler_penalty"] = -1.4
+            breakdown["filler_penalty"] = -1.2
         else:
             breakdown["filler_penalty"] = 0.0
 
         if float(quality.get("noise_ratio", 0.0)) > 0.40:
-            breakdown["noise_penalty"] = -1.4
+            breakdown["noise_penalty"] = -1.2
         else:
             breakdown["noise_penalty"] = 0.0
 
-        if distance > max_shift_sec:
-            breakdown["distance_limit_penalty"] = -999.0
+        if total_tokens >= 15:
+            breakdown["narrative_penalty"] = -1.0
+        elif total_tokens >= 12:
+            breakdown["narrative_penalty"] = -0.5
         else:
-            breakdown["distance_limit_penalty"] = 0.0
+            breakdown["narrative_penalty"] = 0.0
 
-        score = sum(breakdown.values())
+        if is_explain and relaxed:
+            breakdown["explain_penalty_relaxed"] = -1.2
+
+        if relaxed:
+            breakdown["rescue_bonus"] = 0.4
+
+        raw_score = sum(breakdown.values())
+        score = max(0.0, raw_score) * 0.8
+
+        min_required = 2.2 if relaxed else 2.8
+        if score < min_required:
+            result = dict(result_base)
+            result["reject_reason"] = "score_too_low"
+            result["breakdown"] = breakdown
+            result["raw_score"] = raw_score
+            result["score"] = score
+            result["is_explain"] = is_explain
+            return result
 
         return {
             "valid": True,
             "score": score,
+            "raw_score": raw_score,
             "anchor_start": anchor_start,
             "bundle": bundle,
             "text": text,
             "first_line": first_line,
-            "is_explain": False,
+            "is_explain": is_explain,
             "breakdown": breakdown,
             "distance": distance,
             "bundle_duration": bundle_duration,
             "token_count": token_count,
             "total_tokens": total_tokens,
+            "reject_reason": "",
+            "relaxed": relaxed,
         }
 
     def _is_better_opening_than_original(
@@ -1278,6 +1457,7 @@ class HighlightScorer:
         best_eval: Dict[str, Any],
         current_eval: Dict[str, Any],
         improve_threshold: float,
+        rescue_used: bool = False,
     ) -> bool:
         if not best_eval.get("valid", False):
             return False
@@ -1285,15 +1465,19 @@ class HighlightScorer:
         best_score = float(best_eval.get("score", -999.0))
         current_score = float(current_eval.get("score", -999.0))
         current_explain = bool(current_eval.get("is_explain", False))
-
-        if current_explain and best_score > 0.0:
-            return True
+        best_relaxed = bool(best_eval.get("relaxed", False))
 
         if best_score < 0.0:
             return False
 
-        if (best_score - current_score) < improve_threshold:
-            return False
+        if current_explain and rescue_used:
+            return True
+
+        if current_explain and best_score > 0.0:
+            return True
+
+        if current_score < 0.0:
+            return best_score >= improve_threshold
 
         best_first = str(best_eval.get("first_line", ""))
         current_first = str(current_eval.get("first_line", ""))
@@ -1303,13 +1487,20 @@ class HighlightScorer:
         best_has_signal = self._contains_strong_pattern(best_first) or ("?" in best_first) or ("!" in best_first)
         current_has_signal = self._contains_strong_pattern(current_first) or ("?" in current_first) or ("!" in current_first)
 
-        if best_tokens <= current_tokens and best_has_signal:
+        effective_threshold = improve_threshold
+        if rescue_used or best_relaxed:
+            effective_threshold = max(0.05, improve_threshold - 0.25)
+
+        if (best_score - current_score) >= effective_threshold:
             return True
 
-        if best_has_signal and not current_has_signal:
+        if best_has_signal and not current_has_signal and (best_score - current_score) >= max(0.0, effective_threshold - 0.15):
             return True
 
-        return (best_score - current_score) >= (improve_threshold + 0.25)
+        if best_tokens <= current_tokens and best_has_signal and (best_score - current_score) >= max(0.0, effective_threshold - 0.10):
+            return True
+
+        return False
 
     def _apply_rebuilt_opening(
         self,
@@ -1325,6 +1516,8 @@ class HighlightScorer:
         original_score: float,
         original_reasons: List[str],
         original_breakdown: Dict[str, float],
+        current_eval: Dict[str, Any],
+        rescue_used: bool,
     ) -> Optional[HighlightCandidate]:
         if not best_eval.get("valid", False):
             return None
@@ -1333,7 +1526,10 @@ class HighlightScorer:
         if not isinstance(bundle, list) or not bundle:
             return None
 
-        best_anchor_start = float(best_eval.get("anchor_start", original_start))
+        old_first_line = ""
+        if cand.segments:
+            old_first_line = self._normalize_text(str(cand.segments[0].get("text", "")))
+
         opening_bundle_start = float(bundle[0]["start"])
         new_start = max(0.0, opening_bundle_start - pre_roll_sec)
 
@@ -1349,23 +1545,44 @@ class HighlightScorer:
         if new_end <= new_start:
             return None
 
-        new_segments = [
-            seg for seg in all_segments
-            if float(seg["end"]) >= new_start and float(seg["start"]) <= new_end
-        ]
+        eligible = [seg for seg in all_segments if float(seg["start"]) >= new_start and float(seg["start"]) <= new_end]
+        if not eligible:
+            eligible = [seg for seg in all_segments if float(seg["end"]) > new_start and float(seg["start"]) <= new_end]
+
+        if not eligible:
+            return None
+
+        first_idx = None
+        first_seg = eligible[0]
+        for i, seg in enumerate(all_segments):
+            if seg is first_seg:
+                first_idx = i
+                break
+
+        if first_idx is None:
+            return None
+
+        new_segments: List[Dict[str, Any]] = []
+        for seg in all_segments[first_idx:]:
+            seg_start = float(seg["start"])
+            if seg_start > new_end:
+                break
+            new_segments.append(seg)
+
         if not new_segments:
             return None
 
         new_opening = self._build_opening_bundle_by_time(
             segments=new_segments,
             anchor_idx=0,
-            max_bundle_sec=3.4,
+            max_bundle_sec=3.8 if rescue_used else 3.4,
         )
         new_opening_eval = self._score_opening_bundle(
             bundle=new_opening,
             original_start=original_start,
             anchor_start=float(new_opening[0]["start"]) if new_opening else new_start,
-            max_shift_sec=max(float(CLIP.get("hook_max_shift_sec", 8.0)), 6.0),
+            max_shift_sec=max(float(CLIP.get("hook_max_shift_sec", 8.0)), 10.0 if rescue_used else 6.0),
+            relaxed=rescue_used,
         )
         if not new_opening_eval.get("valid", False):
             return None
@@ -1382,22 +1599,90 @@ class HighlightScorer:
         cand.score_breakdown = dict(original_breakdown)
         cand.score_breakdown["hook_retrim"] = round(float(best_eval.get("score", 0.0)), 4)
 
-        hook_delta = max(
-            0.0,
-            float(best_eval.get("score", 0.0)) - float(new_opening_eval.get("score", 0.0)) + float(new_opening_eval.get("score", 0.0))
-        )
-        cand.score = original_score + min(2.8, hook_delta * 0.18)
+        current_score = max(0.0, float(current_eval.get("score", 0.0)))
+        best_score = max(0.0, float(best_eval.get("score", 0.0)))
+        improve_delta = max(0.0, best_score - current_score)
+        cand.score = original_score + min(2.4, improve_delta * 0.45 + (0.25 if rescue_used else 0.0))
 
-        original_first_line = ""
-        if cand.segments:
-            original_first_line = str(cand.segments[0].get("text", ""))
+        new_first_line = self._normalize_text(str(best_eval.get("first_line", "")))
+        rebuilt_reason = f"오프닝 재구성: {old_first_line[:24]} -> {new_first_line[:24]}"
 
-        rebuilt_reason = f"오프닝 재구성: {self._normalize_text(original_first_line)[:24]} -> {str(best_eval.get('first_line', ''))[:24]}"
-        cand.reasons = self._unique_keep_order(
-            original_reasons + ["강한 훅 시작 선택", "설명형 시작 제거", rebuilt_reason]
-        )
+        extra_reasons = ["강한 훅 시작 선택", "설명형 시작 제거", rebuilt_reason]
+        if rescue_used:
+            extra_reasons.append("오프닝 구조 rescue 적용")
+
+        cand.reasons = self._unique_keep_order(original_reasons + extra_reasons)
 
         return cand
+
+    def _rerank_after_rebuild(self, candidates: List[HighlightCandidate]) -> List[HighlightCandidate]:
+        """
+        델타 가산 방식이 아니라 강제 재채점 + 하드 필터 방식으로 최종 랭킹을 다시 만든다.
+        """
+        reranked: List[HighlightCandidate] = []
+
+        for cand in candidates:
+            first_line = ""
+            if cand.segments:
+                first_line = self._normalize_text(str(cand.segments[0].get("text", "")))
+
+            hook_retrim_score = float(cand.score_breakdown.get("hook_retrim", 0.0))
+            opening_penalty = float(cand.score_breakdown.get("opening_penalty", 0.0))
+            base_score = float(cand.score)
+
+            opening_is_explain = self._looks_like_explain_opening(first_line, first_line)
+            opening_has_signal = self._contains_strong_pattern(first_line) or ("?" in first_line) or ("!" in first_line)
+            hook_component = float(cand.score_breakdown.get("hook", 0.0))
+            intensity_component = float(cand.score_breakdown.get("intensity", 0.0))
+            boundary_component = float(cand.score_breakdown.get("boundary", 0.0))
+
+            final_score = base_score
+
+            if hook_retrim_score > 0.0:
+                final_score += min(3.0, 0.8 + hook_retrim_score * 0.35)
+
+            if any(reason == "오프닝 구조 rescue 적용" for reason in cand.reasons):
+                final_score += 0.9
+
+            if any(reason == "강한 훅 시작 선택" for reason in cand.reasons):
+                final_score += 0.8
+
+            final_score += opening_penalty
+
+            if opening_is_explain:
+                final_score -= 3.0
+                cand.reasons = self._unique_keep_order(cand.reasons + ["최종 랭킹 패널티: 설명형 시작"])
+
+            if not opening_has_signal and hook_component < 0.8:
+                final_score -= 2.7
+                cand.reasons = self._unique_keep_order(cand.reasons + ["최종 랭킹 패널티: 훅 약함"])
+
+            if "최종 후보 패널티: no_hook_signal" in cand.reasons:
+                final_score -= 2.5
+
+            if intensity_component < 1.2 and hook_component < 0.8:
+                final_score -= 1.2
+
+            if boundary_component < 0.2:
+                final_score -= 0.6
+
+            hard_fail = False
+            if opening_is_explain and hook_retrim_score <= 0.0:
+                hard_fail = True
+            if "최종 후보 패널티: no_hook_signal" in cand.reasons and hook_retrim_score <= 0.0:
+                hard_fail = True
+
+            if hard_fail:
+                final_score -= 4.0
+                cand.reasons = self._unique_keep_order(cand.reasons + ["최종 하드 필터 적용"])
+
+            cand.score_breakdown["final_rerank_score"] = round(final_score, 4)
+            cand.score = max(0.0, final_score)
+
+            reranked.append(cand)
+
+        reranked.sort(key=lambda x: x.score, reverse=True)
+        return reranked
 
     def _collect_text_within_seconds(self, segments: List[Dict[str, Any]], seconds: float) -> str:
         if not segments:
@@ -1441,7 +1726,60 @@ class HighlightScorer:
         if re.search(r"^(근데|그리고|그래서|그러니까)\b", first):
             return True
 
+        if re.search(r"^(저번에|진짜 웃긴|결국|사실은|그게 뭐냐면|어떻게 됐냐면)", first):
+            return True
+
+        if re.search(r"(뭐냐면|됐냐면|하더라고|하니까|봤더니|보니까|라고 하더라|라고 해서)", first):
+            return True
+
+        if len(self._tokenize(first)) >= 7 and not self._contains_strong_pattern(first):
+            return True
+
         return False
+
+    def _print_hook_debug(
+        self,
+        current_eval: Dict[str, Any],
+        opening_candidates: List[Dict[str, Any]],
+        rejected_candidates: List[Dict[str, Any]],
+        top_n: int,
+        original_start: float,
+        rescue_used: bool,
+    ) -> None:
+        print("\n[HOOK DEBUG]")
+        print(
+            f"  current_start={original_start:.2f} "
+            f"current_score={float(current_eval.get('score', -999.0)):.3f} "
+            f"current_text={str(current_eval.get('first_line', ''))} "
+            f"current_reject={str(current_eval.get('reject_reason', ''))} "
+            f"rescue_used={rescue_used}"
+        )
+
+        valid_top = opening_candidates[:max(1, top_n)]
+        rejected_top = rejected_candidates[:max(1, top_n)]
+
+        if valid_top:
+            for rank, item in enumerate(valid_top, start=1):
+                print(
+                    f"  cand#{rank} "
+                    f"start={float(item.get('anchor_start', 0.0)):.2f} "
+                    f"score={float(item.get('score', -999.0)):.3f} "
+                    f"relaxed={bool(item.get('relaxed', False))} "
+                    f"text={str(item.get('first_line', ''))}"
+                )
+        else:
+            print("  cand#none valid candidate 없음")
+
+        if rejected_top:
+            for rank, item in enumerate(rejected_top, start=1):
+                print(
+                    f"  reject#{rank} "
+                    f"start={float(item.get('anchor_start', 0.0)):.2f} "
+                    f"reason={str(item.get('reject_reason', ''))} "
+                    f"raw={float(item.get('raw_score', -999.0)):.3f} "
+                    f"relaxed={bool(item.get('relaxed', False))} "
+                    f"text={str(item.get('first_line', ''))}"
+                )
 
     # ============================================================
     # Dedupe / ranking
