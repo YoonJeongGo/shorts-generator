@@ -1,5 +1,3 @@
-# 파일 경로: pipeline/highlight_scorer.py
-
 from __future__ import annotations
 
 import math
@@ -289,10 +287,14 @@ class HighlightScorer:
             )
             candidates.extend(extra)
 
-        deduped = self._dedupe_and_rank(candidates, local_top_k)
+        deduped = self._dedupe_and_rank(candidates, max(local_top_k * 3, 8))
         rebuilt = self.rebuild_highlight_openings(deduped, segments_norm)
         reranked = self._rerank_after_rebuild(rebuilt)
-        final_candidates = self._dedupe_and_rank(reranked, local_top_k)
+
+        final_candidates = self._select_final_candidates(
+            candidates=reranked,
+            top_k=local_top_k,
+        )
         return [item.to_dict() for item in final_candidates[:local_top_k]]
 
     # ============================================================
@@ -1598,11 +1600,21 @@ class HighlightScorer:
         cand.quality = self._analyze_window_quality(new_segments, new_text)
         cand.score_breakdown = dict(original_breakdown)
         cand.score_breakdown["hook_retrim"] = round(float(best_eval.get("score", 0.0)), 4)
+        cand.score_breakdown["opening_rebuilt"] = 1.0
+        cand.score_breakdown["opening_rebuilt_rescue"] = 1.0 if rescue_used else 0.0
+        cand.score_breakdown["opening_original_explain"] = 1.0 if bool(current_eval.get("is_explain", False)) else 0.0
+        cand.score_breakdown["opening_current_score"] = round(float(current_eval.get("score", 0.0)), 4)
+        cand.score_breakdown["opening_best_score"] = round(float(best_eval.get("score", 0.0)), 4)
+        cand.score_breakdown["opening_shift_sec"] = round(abs(new_start - original_start), 4)
 
         current_score = max(0.0, float(current_eval.get("score", 0.0)))
         best_score = max(0.0, float(best_eval.get("score", 0.0)))
         improve_delta = max(0.0, best_score - current_score)
-        cand.score = original_score + min(2.4, improve_delta * 0.45 + (0.25 if rescue_used else 0.0))
+
+        # 과승격 방지:
+        # retrim은 살리되, base score를 압도하지 않도록 가산을 제한한다.
+        promoted_bonus = min(1.8, improve_delta * 0.28) + (0.55 if rescue_used else 0.35)
+        cand.score = original_score + promoted_bonus
 
         new_first_line = self._normalize_text(str(best_eval.get("first_line", "")))
         rebuilt_reason = f"오프닝 재구성: {old_first_line[:24]} -> {new_first_line[:24]}"
@@ -1616,9 +1628,6 @@ class HighlightScorer:
         return cand
 
     def _rerank_after_rebuild(self, candidates: List[HighlightCandidate]) -> List[HighlightCandidate]:
-        """
-        델타 가산 방식이 아니라 강제 재채점 + 하드 필터 방식으로 최종 랭킹을 다시 만든다.
-        """
         reranked: List[HighlightCandidate] = []
 
         for cand in candidates:
@@ -1626,63 +1635,266 @@ class HighlightScorer:
             if cand.segments:
                 first_line = self._normalize_text(str(cand.segments[0].get("text", "")))
 
+            base_score = float(cand.score)
             hook_retrim_score = float(cand.score_breakdown.get("hook_retrim", 0.0))
             opening_penalty = float(cand.score_breakdown.get("opening_penalty", 0.0))
-            base_score = float(cand.score)
-
-            opening_is_explain = self._looks_like_explain_opening(first_line, first_line)
-            opening_has_signal = self._contains_strong_pattern(first_line) or ("?" in first_line) or ("!" in first_line)
             hook_component = float(cand.score_breakdown.get("hook", 0.0))
             intensity_component = float(cand.score_breakdown.get("intensity", 0.0))
             boundary_component = float(cand.score_breakdown.get("boundary", 0.0))
+            contrast_component = float(cand.score_breakdown.get("contrast", 0.0))
+            dialog_component = float(cand.score_breakdown.get("dialog", 0.0))
+            quality_component = float(cand.score_breakdown.get("quality", 0.0))
+            shift_sec = float(cand.score_breakdown.get("opening_shift_sec", 0.0))
+
+            opening_is_explain = self._looks_like_explain_opening(first_line, first_line)
+            opening_has_signal = self._contains_strong_pattern(first_line) or ("?" in first_line) or ("!" in first_line)
+
+            has_retrim = hook_retrim_score > 0.0
+            rescue_applied = "오프닝 구조 rescue 적용" in cand.reasons
+            strong_hook_selected = "강한 훅 시작 선택" in cand.reasons
+            original_explain_fixed = float(cand.score_breakdown.get("opening_original_explain", 0.0)) > 0.0
+            no_hook_penalized = "최종 후보 패널티: no_hook_signal" in cand.reasons
 
             final_score = base_score
-
-            if hook_retrim_score > 0.0:
-                final_score += min(3.0, 0.8 + hook_retrim_score * 0.35)
-
-            if any(reason == "오프닝 구조 rescue 적용" for reason in cand.reasons):
-                final_score += 0.9
-
-            if any(reason == "강한 훅 시작 선택" for reason in cand.reasons):
-                final_score += 0.8
-
             final_score += opening_penalty
 
+            # strict 강자 보호
+            strict_strength = 0.0
+            if not has_retrim and hook_component >= 2.0:
+                strict_strength += 1.5
+            if not has_retrim and intensity_component >= 2.4:
+                strict_strength += 0.7
+            if not has_retrim and dialog_component >= 2.0:
+                strict_strength += 0.5
+            final_score += strict_strength
+
+            # retrim 보너스 축소
+            if has_retrim:
+                final_score += min(1.4, hook_retrim_score * 0.18)
+
+            if strong_hook_selected:
+                final_score += 0.7
+
+            if rescue_applied:
+                final_score += 0.85
+
+            if original_explain_fixed and has_retrim:
+                final_score += 0.9
+
+            if rescue_applied and original_explain_fixed and has_retrim:
+                final_score += 0.8
+
+            if opening_has_signal:
+                final_score += 0.35
+            elif hook_component >= 1.0:
+                final_score += 0.15
+
+            if contrast_component >= 0.8 and intensity_component >= 1.4:
+                final_score += 0.35
+
+            # hook window 자체가 약하면 강하게 제한
+            if hook_component <= 0.3:
+                final_score -= 2.8
+                cand.reasons = self._unique_keep_order(cand.reasons + ["최종 랭킹 패널티: window hook 약함"])
+
+                # rescue/retrim인데도 window hook이 약하면 과승격 차단
+                if has_retrim:
+                    final_score -= 1.2
+                if rescue_applied:
+                    final_score -= 0.8
+
+            if hook_component <= 0.3 and has_retrim and rescue_applied:
+                final_score -= 1.0
+
+            # shift가 너무 크면 감점
+            if shift_sec >= 8.0:
+                final_score -= 1.1
+                cand.reasons = self._unique_keep_order(cand.reasons + ["최종 랭킹 패널티: retrim 이동 과다"])
+            elif shift_sec >= 6.0:
+                final_score -= 0.5
+
             if opening_is_explain:
-                final_score -= 3.0
-                cand.reasons = self._unique_keep_order(cand.reasons + ["최종 랭킹 패널티: 설명형 시작"])
+                if has_retrim:
+                    final_score -= 0.8
+                    cand.reasons = self._unique_keep_order(cand.reasons + ["최종 랭킹 경고: 설명형 성분 잔존"])
+                else:
+                    final_score -= 4.0
+                    cand.reasons = self._unique_keep_order(cand.reasons + ["최종 랭킹 패널티: 설명형 시작"])
 
             if not opening_has_signal and hook_component < 0.8:
-                final_score -= 2.7
+                if has_retrim:
+                    final_score -= 0.8
+                else:
+                    final_score -= 3.0
                 cand.reasons = self._unique_keep_order(cand.reasons + ["최종 랭킹 패널티: 훅 약함"])
 
-            if "최종 후보 패널티: no_hook_signal" in cand.reasons:
-                final_score -= 2.5
+            if no_hook_penalized:
+                if has_retrim:
+                    final_score -= 1.1
+                else:
+                    final_score -= 3.0
 
             if intensity_component < 1.2 and hook_component < 0.8:
-                final_score -= 1.2
+                final_score -= 1.1
 
             if boundary_component < 0.2:
-                final_score -= 0.6
+                final_score -= 0.8
+
+            if quality_component < 0.2:
+                final_score -= 0.7
 
             hard_fail = False
-            if opening_is_explain and hook_retrim_score <= 0.0:
+            if opening_is_explain and not has_retrim:
                 hard_fail = True
-            if "최종 후보 패널티: no_hook_signal" in cand.reasons and hook_retrim_score <= 0.0:
+            if no_hook_penalized and not has_retrim:
                 hard_fail = True
 
             if hard_fail:
                 final_score -= 4.0
                 cand.reasons = self._unique_keep_order(cand.reasons + ["최종 하드 필터 적용"])
 
+            final_bucket_rank = self._candidate_bucket_rank(cand, first_line)
+            bucket_bonus = {
+                0: 2.4,
+                1: 1.1,
+                2: 0.0,
+                3: -3.6,
+            }.get(final_bucket_rank, 0.0)
+            final_score += bucket_bonus
+
+            # hook=0에 가까운 후보는 bucket 0이어도 최상위 독주 방지
+            if hook_component <= 0.3 and final_bucket_rank == 0:
+                final_score -= 2.2
+                cand.reasons = self._unique_keep_order(cand.reasons + ["최종 랭킹 제한: retrim 우선 과다 방지"])
+
+            cand.score_breakdown["final_bucket_rank"] = float(final_bucket_rank)
+            cand.score_breakdown["final_bucket_bonus"] = round(bucket_bonus, 4)
             cand.score_breakdown["final_rerank_score"] = round(final_score, 4)
             cand.score = max(0.0, final_score)
 
             reranked.append(cand)
 
-        reranked.sort(key=lambda x: x.score, reverse=True)
+        reranked.sort(
+            key=lambda x: (
+                int(x.score_breakdown.get("final_bucket_rank", 99)),
+                -x.score,
+                -float(x.score_breakdown.get("hook", 0.0)),
+                -float(x.score_breakdown.get("hook_retrim", 0.0)),
+            )
+        )
         return reranked
+
+    def _candidate_bucket_rank(self, cand: HighlightCandidate, first_line: Optional[str] = None) -> int:
+        if first_line is None:
+            first_line = ""
+            if cand.segments:
+                first_line = self._normalize_text(str(cand.segments[0].get("text", "")))
+
+        opening_is_explain = self._looks_like_explain_opening(first_line, first_line)
+        opening_has_signal = self._contains_strong_pattern(first_line) or ("?" in first_line) or ("!" in first_line)
+
+        hook_retrim_score = float(cand.score_breakdown.get("hook_retrim", 0.0))
+        hook_component = float(cand.score_breakdown.get("hook", 0.0))
+        intensity_component = float(cand.score_breakdown.get("intensity", 0.0))
+        dialog_component = float(cand.score_breakdown.get("dialog", 0.0))
+
+        has_retrim = hook_retrim_score > 0.0
+        rescue_applied = "오프닝 구조 rescue 적용" in cand.reasons
+        strong_hook_selected = "강한 훅 시작 선택" in cand.reasons
+        original_explain_fixed = float(cand.score_breakdown.get("opening_original_explain", 0.0)) > 0.0
+        no_hook_penalized = "최종 후보 패널티: no_hook_signal" in cand.reasons
+
+        # 1순위: retrim 성공 + 실제 window hook도 살아있는 경우만
+        if (
+            has_retrim
+            and rescue_applied
+            and original_explain_fixed
+            and strong_hook_selected
+            and opening_has_signal
+            and hook_component >= 0.9
+        ):
+            return 0
+
+        # 2순위: retrim 성공 또는 원래 강한 strict 후보
+        if (
+            has_retrim
+            and strong_hook_selected
+            and opening_has_signal
+            and not opening_is_explain
+            and hook_component >= 0.6
+        ):
+            return 1
+
+        if (
+            not has_retrim
+            and not opening_is_explain
+            and hook_component >= 1.5
+            and (intensity_component >= 1.8 or dialog_component >= 1.6)
+            and not no_hook_penalized
+        ):
+            return 1
+
+        # 3순위: 평범하지만 쓸만한 후보
+        if not opening_is_explain and (opening_has_signal or hook_component >= 1.0) and not no_hook_penalized:
+            return 2
+
+        return 3
+
+    def _select_final_candidates(
+        self,
+        candidates: List[HighlightCandidate],
+        top_k: int,
+    ) -> List[HighlightCandidate]:
+        if not candidates:
+            return []
+
+        bucket_0: List[HighlightCandidate] = []
+        bucket_1: List[HighlightCandidate] = []
+        bucket_2: List[HighlightCandidate] = []
+        bucket_3: List[HighlightCandidate] = []
+
+        for cand in candidates:
+            first_line = ""
+            if cand.segments:
+                first_line = self._normalize_text(str(cand.segments[0].get("text", "")))
+
+            bucket_rank = self._candidate_bucket_rank(cand, first_line)
+            if bucket_rank == 0:
+                bucket_0.append(cand)
+            elif bucket_rank == 1:
+                bucket_1.append(cand)
+            elif bucket_rank == 2:
+                bucket_2.append(cand)
+            else:
+                bucket_3.append(cand)
+
+        bucket_0 = self._dedupe_and_rank(bucket_0, max(top_k * 2, 4))
+        bucket_1 = self._dedupe_and_rank(bucket_1, max(top_k * 2, 4))
+        bucket_2 = self._dedupe_and_rank(bucket_2, max(top_k * 2, 4))
+        bucket_3 = self._dedupe_and_rank(bucket_3, max(top_k * 2, 4))
+
+        selected: List[HighlightCandidate] = []
+
+        for group in (bucket_0, bucket_1, bucket_2, bucket_3):
+            for cand in group:
+                if any(self._is_near_duplicate(cand, chosen) for chosen in selected):
+                    continue
+                selected.append(cand)
+                if len(selected) >= top_k:
+                    break
+            if len(selected) >= top_k:
+                break
+
+        if len(selected) < top_k:
+            fallback = self._dedupe_and_rank(candidates, max(top_k * 3, 8))
+            for cand in fallback:
+                if any(self._is_near_duplicate(cand, chosen) for chosen in selected):
+                    continue
+                selected.append(cand)
+                if len(selected) >= top_k:
+                    break
+
+        return selected
 
     def _collect_text_within_seconds(self, segments: List[Dict[str, Any]], seconds: float) -> str:
         if not segments:

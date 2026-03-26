@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from config import VIDEO
 
@@ -55,8 +55,10 @@ def probe_video_metadata(video_path: str) -> Dict[str, Any]:
 
     command = [
         "ffprobe",
-        "-v", "error",
-        "-print_format", "json",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
         "-show_streams",
         "-show_format",
         video_path,
@@ -172,7 +174,6 @@ def build_vertical_filter(
 
     source_ratio = display_width / max(display_height, 1)
 
-    # 이미 세로에 가까운 영상은 fit + pad
     if source_ratio <= 0.80:
         return (
             f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
@@ -190,6 +191,103 @@ def build_vertical_filter(
     )
 
 
+def _looks_like_sentence_end(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+
+    if normalized.endswith(("?", "!", ".", "…")):
+        return True
+
+    sentence_endings = (
+        "다",
+        "요",
+        "죠",
+        "네",
+        "야",
+        "입니다",
+        "거든",
+        "맞아",
+        "맞습니다",
+        "했다",
+        "합니다",
+        "됐어",
+        "됐다",
+        "좋아",
+        "끝",
+        "라고요",
+        "냐고요",
+        "있습니다",
+        "없습니다",
+        "했죠",
+        "하죠",
+        "거예요",
+        "거에요",
+    )
+    return any(normalized.endswith(ending) for ending in sentence_endings)
+
+
+def _is_good_end_segment(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+
+    if _looks_like_sentence_end(normalized):
+        return True
+
+    if len(normalized) <= 2:
+        return False
+
+    natural_tail_patterns = (
+        "솔직히",
+        "그렇죠",
+        "맞죠",
+        "아니죠",
+        "왜요",
+        "뭐예요",
+        "뭐에요",
+        "뭐죠",
+        "알아요",
+        "모르죠",
+    )
+    return any(normalized.endswith(pattern) for pattern in natural_tail_patterns)
+
+
+def adjust_end_with_stt(
+    end_sec: float,
+    segments: List[Dict[str, Any]],
+    max_extend_sec: float = 3.0,
+) -> float:
+    """
+    end_sec 이후 max_extend_sec 범위 안에서
+    가장 가까운 '자연스러운 문장 끝' 세그먼트의 end 시점으로 확장한다.
+    없으면 원래 end_sec를 그대로 사용한다.
+    """
+    original_end = float(end_sec)
+    best_end = original_end
+    best_gap = float("inf")
+
+    for seg in segments:
+        seg_end = float(seg.get("end", 0.0) or 0.0)
+        seg_text = str(seg.get("text", "") or "").strip()
+
+        if seg_end < original_end:
+            continue
+
+        gap = seg_end - original_end
+        if gap > max_extend_sec:
+            continue
+
+        if not _is_good_end_segment(seg_text):
+            continue
+
+        if gap < best_gap:
+            best_gap = gap
+            best_end = seg_end
+
+    return best_end
+
+
 def _clamp_clip_range(
     start_sec: float,
     end_sec: float,
@@ -203,7 +301,6 @@ def _clamp_clip_range(
     adjusted_start = max(0.0, float(start_sec) - float(lead_in_sec))
     adjusted_end = min(float(total_duration), float(end_sec) + float(tail_out_sec))
 
-    # 보정 후에도 길이가 이상하면 원래 범위 유지
     if adjusted_end <= adjusted_start:
         adjusted_start = max(0.0, float(start_sec))
         adjusted_end = min(float(total_duration), float(end_sec))
@@ -219,9 +316,11 @@ def cut_clip(
     start_sec: float,
     end_sec: float,
     output_path: str,
+    segments: Optional[List[Dict[str, Any]]] = None,
     vf_override: Optional[str] = None,
     lead_in_sec: float = 0.7,
     tail_out_sec: float = 0.7,
+    max_stt_end_extend_sec: float = 3.0,
 ) -> str:
     """
     지정 구간을 세로 쇼츠용 mp4로 잘라 저장
@@ -229,6 +328,7 @@ def cut_clip(
     추가 기능:
     - 시작 전 lead_in_sec 만큼 앞당김
     - 끝 후 tail_out_sec 만큼 늘림
+    - segments가 주어지면 end_sec 이후 가까운 자연스러운 문장 끝까지 확장
     """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"입력 영상이 존재하지 않습니다: {video_path}")
@@ -241,9 +341,17 @@ def cut_clip(
 
     meta = probe_video_metadata(video_path)
 
+    final_end_sec = float(end_sec)
+    if segments:
+        final_end_sec = adjust_end_with_stt(
+            end_sec=float(end_sec),
+            segments=segments,
+            max_extend_sec=float(max_stt_end_extend_sec),
+        )
+
     adjusted_start, adjusted_end = _clamp_clip_range(
         start_sec=float(start_sec),
-        end_sec=float(end_sec),
+        end_sec=float(final_end_sec),
         total_duration=float(meta["duration"]),
         lead_in_sec=float(lead_in_sec),
         tail_out_sec=float(tail_out_sec),
@@ -266,16 +374,26 @@ def cut_clip(
     command = [
         "ffmpeg",
         "-y",
-        "-ss", f"{adjusted_start:.3f}",
-        "-i", video_path,
-        "-t", f"{duration:.3f}",
-        "-vf", vf,
-        "-c:v", str(VIDEO.get("video_codec", "libx264")),
-        "-preset", str(VIDEO.get("preset", "fast")),
-        "-crf", str(VIDEO.get("crf", "23")),
-        "-c:a", str(VIDEO.get("audio_codec", "aac")),
-        "-b:a", str(VIDEO.get("audio_bitrate", "128k")),
-        "-movflags", "+faststart",
+        "-ss",
+        f"{adjusted_start:.3f}",
+        "-i",
+        video_path,
+        "-t",
+        f"{duration:.3f}",
+        "-vf",
+        vf,
+        "-c:v",
+        str(VIDEO.get("video_codec", "libx264")),
+        "-preset",
+        str(VIDEO.get("preset", "fast")),
+        "-crf",
+        str(VIDEO.get("crf", "23")),
+        "-c:a",
+        str(VIDEO.get("audio_codec", "aac")),
+        "-b:a",
+        str(VIDEO.get("audio_bitrate", "128k")),
+        "-movflags",
+        "+faststart",
         output_path,
     ]
 
@@ -295,5 +413,6 @@ if __name__ == "__main__":
             start_sec=0.0,
             end_sec=20.0,
             output_path=out,
+            segments=None,
         )
         print(f"[INFO] saved: {out}")
