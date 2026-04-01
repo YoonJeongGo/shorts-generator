@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import VIDEO
 
@@ -139,25 +139,6 @@ def build_vertical_filter(
     crop_anchor_x: float = 0.50,
     crop_anchor_y: float = 0.50,
 ) -> str:
-    """
-    세로 쇼츠용 soft crop 필터 생성
-
-    방식:
-    1) 비율 유지한 채 target canvas보다 작지 않게 확대
-       (force_original_aspect_ratio=increase)
-    2) 중앙 기준으로 crop
-    3) y축 anchor를 중앙 쪽으로 두어 인물/장면 집중도를 높임
-
-    crop_anchor_x:
-        0.0 = 맨 왼쪽
-        0.5 = 중앙
-        1.0 = 맨 오른쪽
-
-    crop_anchor_y:
-        0.0 = 맨 위
-        0.5 = 중앙
-        1.0 = 맨 아래
-    """
     if width <= 0 or height <= 0:
         raise ValueError("width/height는 0보다 커야 합니다.")
 
@@ -191,12 +172,16 @@ def build_vertical_filter(
     )
 
 
+def _normalize_text(text: str) -> str:
+    return " ".join(str(text or "").strip().split())
+
+
 def _looks_like_sentence_end(text: str) -> bool:
-    normalized = str(text or "").strip()
+    normalized = _normalize_text(text)
     if not normalized:
         return False
 
-    if normalized.endswith(("?", "!", ".", "…")):
+    if normalized.endswith(("?", "!", ".", "…", "~")):
         return True
 
     sentence_endings = (
@@ -211,6 +196,7 @@ def _looks_like_sentence_end(text: str) -> bool:
         "맞습니다",
         "했다",
         "합니다",
+        "됩니다",
         "됐어",
         "됐다",
         "좋아",
@@ -223,69 +209,482 @@ def _looks_like_sentence_end(text: str) -> bool:
         "하죠",
         "거예요",
         "거에요",
+        "싶어요",
+        "싶습니다",
+        "된 거야",
+        "된 거예요",
+        "맞지",
+        "맞죠",
+        "아니야",
+        "아니에요",
+        "아닙니다",
+        "했다고",
+        "했다고",
     )
     return any(normalized.endswith(ending) for ending in sentence_endings)
 
 
-def _is_good_end_segment(text: str) -> bool:
-    normalized = str(text or "").strip()
+def _looks_like_incomplete_tail(text: str) -> bool:
+    normalized = _normalize_text(text)
     if not normalized:
-        return False
+        return True
 
-    if _looks_like_sentence_end(normalized):
+    if normalized.endswith(("...", "…", ",", ":", ";", "-", "—", "–", "/", "(")):
+        return True
+
+    incomplete_endings = (
+        "그",
+        "저",
+        "이",
+        "저기",
+        "근데",
+        "그래서",
+        "그러니까",
+        "그러면",
+        "그리고",
+        "하지만",
+        "근데요",
+        "그래서요",
+        "그러니까요",
+        "뭐",
+        "뭐가",
+        "뭐냐면",
+        "왜",
+        "왜냐",
+        "왜냐면",
+        "이제",
+        "지금",
+        "있는",
+        "없는",
+        "하는",
+        "되는",
+        "될",
+        "된",
+        "해서",
+        "하고",
+        "이며",
+        "인데",
+        "인데요",
+        "거",
+        "것",
+        "때문",
+        "때문에",
+        "명분이",
+        "권한이",
+        "얘기가",
+        "상황이",
+        "문제가",
+        "부분이",
+        "느낌이",
+        "말이",
+        "를",
+        "을",
+        "은",
+        "는",
+        "이",
+        "가",
+        "에",
+        "에서",
+        "로",
+        "으로",
+        "와",
+        "과",
+    )
+    if any(normalized.endswith(ending) for ending in incomplete_endings):
+        return True
+
+    tokens = normalized.split()
+    if not tokens:
+        return True
+
+    last_token = tokens[-1]
+    incomplete_tokens = {
+        "그",
+        "저",
+        "이",
+        "뭐",
+        "왜",
+        "근데",
+        "그리고",
+        "그래서",
+        "그러니까",
+        "있는",
+        "없는",
+        "하는",
+        "되는",
+        "인데",
+        "인데요",
+        "명분이",
+        "권한이",
+        "상황이",
+        "문제가",
+        "부분이",
+        "얘기가",
+        "말이",
+    }
+    if last_token in incomplete_tokens:
         return True
 
     if len(normalized) <= 2:
+        return True
+
+    return False
+
+
+def _starts_like_continuation(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if not normalized:
         return False
 
-    natural_tail_patterns = (
-        "솔직히",
-        "그렇죠",
-        "맞죠",
-        "아니죠",
-        "왜요",
-        "뭐예요",
-        "뭐에요",
-        "뭐죠",
-        "알아요",
-        "모르죠",
+    continuation_starts = (
+        "그래서",
+        "그러니까",
+        "그리고",
+        "근데",
+        "근데요",
+        "근데 그",
+        "근데 지금",
+        "근데 이게",
+        "근데 그게",
+        "근데 그건",
+        "그러면",
+        "그럼",
+        "아니",
+        "아니 근데",
+        "그래도",
+        "그 다음에",
+        "그래서 지금",
+        "그래서 명분이",
+        "그래서 그",
+        "그래서 이",
+        "그",
+        "그게",
+        "그건",
+        "그걸",
+        "그거",
+        "이게",
+        "이건",
+        "이걸",
+        "저게",
+        "저건",
+        "저걸",
+        "또",
     )
-    return any(normalized.endswith(pattern) for pattern in natural_tail_patterns)
+    return any(normalized.startswith(prefix) for prefix in continuation_starts)
+
+
+def _is_reaction_like(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return False
+
+    reaction_words = (
+        "어",
+        "아",
+        "어?",
+        "아?",
+        "뭐?",
+        "예?",
+        "왜?",
+        "아니",
+        "아니야",
+        "아니요",
+        "뭐야",
+        "뭔데",
+        "진짜",
+        "와",
+        "헐",
+        "야",
+        "어이",
+        "허",
+    )
+    if normalized in reaction_words:
+        return True
+
+    if len(normalized) <= 3 and normalized.endswith(("?", "!")):
+        return True
+
+    return False
+
+
+def _find_search_start_index(end_sec: float, segments: List[Dict[str, Any]]) -> int:
+    original_end = float(end_sec)
+    for i, seg in enumerate(segments):
+        seg_start = float(seg.get("start", 0.0) or 0.0)
+        seg_end = float(seg.get("end", 0.0) or 0.0)
+        if seg_start <= original_end <= seg_end:
+            return i
+        if seg_end >= original_end:
+            return i
+    return max(0, len(segments) - 1)
+
+
+def _candidate_context(
+    idx: int,
+    segments: List[Dict[str, Any]],
+) -> Tuple[str, float, Optional[str], Optional[float], Optional[float]]:
+    seg = segments[idx]
+    text = _normalize_text(seg.get("text", ""))
+    seg_end = float(seg.get("end", 0.0) or 0.0)
+
+    next_text: Optional[str] = None
+    gap_after: Optional[float] = None
+    next_seg_duration: Optional[float] = None
+
+    if idx + 1 < len(segments):
+        next_seg = segments[idx + 1]
+        next_text = _normalize_text(next_seg.get("text", ""))
+        next_start = float(next_seg.get("start", 0.0) or 0.0)
+        next_end = float(next_seg.get("end", 0.0) or 0.0)
+        gap_after = next_start - seg_end
+        next_seg_duration = max(0.0, next_end - next_start)
+
+    return text, seg_end, next_text, gap_after, next_seg_duration
+
+
+def _has_close_following_dialogue(
+    idx: int,
+    segments: List[Dict[str, Any]],
+    max_check_count: int = 2,
+) -> bool:
+    current_end = float(segments[idx].get("end", 0.0) or 0.0)
+
+    for offset in range(1, max_check_count + 1):
+        next_idx = idx + offset
+        if next_idx >= len(segments):
+            break
+
+        next_seg = segments[next_idx]
+        next_text = _normalize_text(next_seg.get("text", ""))
+        next_start = float(next_seg.get("start", 0.0) or 0.0)
+        gap = next_start - current_end
+
+        if gap > 1.20:
+            break
+
+        if not next_text:
+            continue
+
+        if _is_reaction_like(next_text):
+            continue
+
+        return True
+
+    return False
+
+
+def _is_hard_reject_candidate(
+    idx: int,
+    segments: List[Dict[str, Any]],
+    original_end: float,
+) -> bool:
+    text, seg_end, next_text, gap_after, next_seg_duration = _candidate_context(idx, segments)
+
+    if seg_end < original_end:
+        return True
+
+    is_sentence_end = _looks_like_sentence_end(text)
+    is_incomplete = _looks_like_incomplete_tail(text)
+
+    if is_incomplete:
+        return True
+
+    if not is_sentence_end and gap_after is not None and gap_after < 1.00:
+        return True
+
+    if gap_after is not None and gap_after < 0.30:
+        return True
+
+    if next_text:
+        if _starts_like_continuation(next_text) and gap_after is not None and gap_after < 1.25:
+            return True
+
+        if (
+            not is_sentence_end
+            and not _is_reaction_like(next_text)
+            and gap_after is not None
+            and gap_after < 1.25
+        ):
+            return True
+
+        if (
+            is_sentence_end
+            and gap_after is not None
+            and gap_after < 0.55
+            and not _is_reaction_like(next_text)
+        ):
+            return True
+
+        if (
+            _has_close_following_dialogue(idx, segments, max_check_count=2)
+            and gap_after is not None
+            and gap_after < 0.90
+        ):
+            return True
+
+        if (
+            next_seg_duration is not None
+            and next_seg_duration >= 1.00
+            and gap_after is not None
+            and gap_after < 0.70
+            and not _is_reaction_like(next_text)
+        ):
+            return True
+
+    return False
+
+
+def _score_end_candidate(
+    idx: int,
+    segments: List[Dict[str, Any]],
+    original_end: float,
+    max_extend_sec: float,
+) -> float:
+    seg = segments[idx]
+    seg_end = float(seg.get("end", 0.0) or 0.0)
+    seg_start = float(seg.get("start", 0.0) or 0.0)
+
+    if seg_end < original_end:
+        return -99999.0
+
+    gap_from_original = seg_end - original_end
+    if gap_from_original > max_extend_sec:
+        return -99999.0
+
+    if _is_hard_reject_candidate(idx, segments, original_end):
+        return -99999.0
+
+    text, _, next_text, gap_after, _ = _candidate_context(idx, segments)
+
+    score = 0.0
+    is_sentence_end = _looks_like_sentence_end(text)
+
+    if is_sentence_end:
+        score += 10.0
+
+    if seg_start <= original_end <= seg_end:
+        score += 1.0
+
+    if gap_after is None:
+        score += 4.0
+    else:
+        if gap_after < 0.35:
+            score -= 7.0
+        elif gap_after < 0.55:
+            score -= 3.5
+        elif gap_after < 0.75:
+            score -= 1.0
+        elif gap_after <= 1.80:
+            score += 4.5
+        else:
+            score += 1.5
+
+        if next_text and _is_reaction_like(next_text):
+            score += 1.0
+
+    if gap_from_original < 0.25:
+        score -= 3.0
+    elif gap_from_original < 0.50:
+        score -= 1.5
+    elif 0.80 <= gap_from_original <= 3.20:
+        score += 2.5
+
+    score -= gap_from_original * 0.45
+
+    if len(text) <= 3:
+        score -= 2.5
+    elif len(text) <= 6:
+        score -= 1.0
+
+    return score
 
 
 def adjust_end_with_stt(
     end_sec: float,
     segments: List[Dict[str, Any]],
-    max_extend_sec: float = 3.0,
+    max_extend_sec: float = 6.0,
 ) -> float:
-    """
-    end_sec 이후 max_extend_sec 범위 안에서
-    가장 가까운 '자연스러운 문장 끝' 세그먼트의 end 시점으로 확장한다.
-    없으면 원래 end_sec를 그대로 사용한다.
-    """
     original_end = float(end_sec)
-    best_end = original_end
-    best_gap = float("inf")
+    if not segments:
+        return original_end
 
-    for seg in segments:
+    start_idx = _find_search_start_index(original_end, segments)
+
+    all_candidates: List[Tuple[float, float, int]] = []
+    accepted_candidates: List[Tuple[float, float, int]] = []
+    last_valid_seg_end = original_end
+
+    for i in range(start_idx, len(segments)):
+        seg = segments[i]
         seg_end = float(seg.get("end", 0.0) or 0.0)
-        seg_text = str(seg.get("text", "") or "").strip()
 
         if seg_end < original_end:
             continue
 
-        gap = seg_end - original_end
-        if gap > max_extend_sec:
+        gap_from_original = seg_end - original_end
+        if gap_from_original > max_extend_sec:
+            break
+
+        last_valid_seg_end = max(last_valid_seg_end, seg_end)
+
+        score = _score_end_candidate(
+            idx=i,
+            segments=segments,
+            original_end=original_end,
+            max_extend_sec=max_extend_sec,
+        )
+        all_candidates.append((score, seg_end, i))
+
+        if score > -90000.0:
+            accepted_candidates.append((score, seg_end, i))
+
+    if accepted_candidates:
+        best_score, best_end, _ = max(accepted_candidates, key=lambda x: x[0])
+        if best_score >= 0.0:
+            return best_end
+
+    fallback_complete_candidates: List[Tuple[float, float, int]] = []
+    for _, seg_end, idx in all_candidates:
+        text, _, next_text, gap_after, _ = _candidate_context(idx, segments)
+
+        if _looks_like_incomplete_tail(text):
+            continue
+        if not _looks_like_sentence_end(text):
+            continue
+        if gap_after is not None and gap_after < 0.45 and next_text and not _is_reaction_like(next_text):
+            continue
+        if gap_after is not None and gap_after < 0.80 and next_text and _starts_like_continuation(next_text):
+            continue
+        if _has_close_following_dialogue(idx, segments, max_check_count=2) and gap_after is not None and gap_after < 0.90:
             continue
 
-        if not _is_good_end_segment(seg_text):
-            continue
+        fallback_score = 0.0
 
-        if gap < best_gap:
-            best_gap = gap
-            best_end = seg_end
+        if gap_after is None:
+            fallback_score += 4.0
+        else:
+            if gap_after < 0.45:
+                fallback_score -= 4.0
+            elif gap_after < 0.75:
+                fallback_score -= 1.5
+            elif gap_after <= 2.00:
+                fallback_score += 3.5
+            else:
+                fallback_score += 1.0
 
-    return best_end
+            if next_text and _starts_like_continuation(next_text) and gap_after < 1.20:
+                fallback_score -= 3.5
+
+        gap_from_original = seg_end - original_end
+        fallback_score -= gap_from_original * 0.40
+
+        fallback_complete_candidates.append((fallback_score, seg_end, idx))
+
+    if fallback_complete_candidates:
+        _, fallback_end, _ = max(fallback_complete_candidates, key=lambda x: x[0])
+        return fallback_end
+
+    return last_valid_seg_end
 
 
 def _clamp_clip_range(
@@ -295,9 +694,6 @@ def _clamp_clip_range(
     lead_in_sec: float,
     tail_out_sec: float,
 ) -> tuple[float, float]:
-    """
-    시작/끝 보정 후 영상 길이 범위 안으로 보정
-    """
     adjusted_start = max(0.0, float(start_sec) - float(lead_in_sec))
     adjusted_end = min(float(total_duration), float(end_sec) + float(tail_out_sec))
 
@@ -320,16 +716,8 @@ def cut_clip(
     vf_override: Optional[str] = None,
     lead_in_sec: float = 0.7,
     tail_out_sec: float = 0.7,
-    max_stt_end_extend_sec: float = 3.0,
+    max_stt_end_extend_sec: float = 6.0,
 ) -> str:
-    """
-    지정 구간을 세로 쇼츠용 mp4로 잘라 저장
-
-    추가 기능:
-    - 시작 전 lead_in_sec 만큼 앞당김
-    - 끝 후 tail_out_sec 만큼 늘림
-    - segments가 주어지면 end_sec 이후 가까운 자연스러운 문장 끝까지 확장
-    """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"입력 영상이 존재하지 않습니다: {video_path}")
 
@@ -407,7 +795,7 @@ if __name__ == "__main__":
         info = probe_video_metadata(sample_video)
         print("[INFO] video meta =", info)
 
-        out = "output/test_vertical_softcrop.mp4"
+        out = "output/test_fixed_end_v4.mp4"
         cut_clip(
             video_path=sample_video,
             start_sec=0.0,
