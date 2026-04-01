@@ -113,7 +113,9 @@ class PlayerControlBar(QWidget):
         self._btn_plus5.clicked.connect(lambda: self.step_requested.emit(5000))
         self._btn_in.clicked.connect(self.set_in_requested)
         self._btn_out.clicked.connect(self.set_out_requested)
-        self._vol_slider.valueChanged.connect(lambda v: self.volume_changed.emit(v / 100.0))
+        self._vol_slider.valueChanged.connect(
+            lambda v: self.volume_changed.emit(v / 100.0)
+        )
 
     def set_position_ms(self, ms: int) -> None:
         if self._seeking:
@@ -156,7 +158,6 @@ class SubtitleOverlayLabel(QLabel):
             "color: white;"
             "font-size: 18px;"
             "font-weight: bold;"
-            "text-shadow: 0 0 6px black, 0 0 6px black;"
             "padding-bottom: 16px; padding-left: 8px; padding-right: 8px;"
         )
         self.setText("")
@@ -211,8 +212,8 @@ class PlayerPanel(QWidget):
         self._player.durationChanged.connect(self._control_bar.set_duration_ms)
         self._player.playbackStateChanged.connect(self._on_playback_state_changed)
 
-        self._player.positionChanged.connect(self.position_changed)
-        self._player.durationChanged.connect(self.duration_changed)
+        self._player.positionChanged.connect(self._on_position_changed)
+        self._player.durationChanged.connect(self._on_duration_changed)
 
         self._control_bar.play_pause_clicked.connect(self.toggle_play_pause)
         self._control_bar.seek_requested.connect(self._player.setPosition)
@@ -257,6 +258,14 @@ class PlayerPanel(QWidget):
 
     def current_position_ms(self) -> int:
         return self._player.position()
+
+    @Slot(int)
+    def _on_position_changed(self, ms: int) -> None:
+        self.position_changed.emit(ms)
+
+    @Slot(int)
+    def _on_duration_changed(self, ms: int) -> None:
+        self.duration_changed.emit(ms)
 
     @Slot(QMediaPlayer.PlaybackState)
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
